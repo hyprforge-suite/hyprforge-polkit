@@ -1,0 +1,59 @@
+# CI for the hyprforge-polkit repository. In the Hyprforge monorepo this directory
+# is a submodule at `crates/hyprforge-polkit`; this file takes effect only here, at
+# the repository's root.
+#
+# What this checks: the crate builds, clippy is silent (a clippy warning
+# is a build failure in Hyprforge), and the tests that need nothing but
+# this process — the helper protocol against a stand-in helper, the
+# conversation, the prompt model and its layout.
+#
+# What it deliberately does NOT check:
+#   - it never talks to polkitd or PAM. The one live test (the
+#     registration signature, read from polkitd itself) is ignored here;
+#     and no test anywhere types a password at real PAM, because
+#     pam_faillock locks an account after three wrong ones.
+#   - it never opens a surface: there is no compositor on a runner.
+#
+# A green run means the code is internally consistent. It does not mean
+# a prompt has ever been answered.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tier-1:
+    name: "Tier 1 (no compositor, no polkitd): build, clippy -D warnings, cargo test"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        # `rustup show` is what makes rustup notice rust-toolchain.toml
+        # here and install exactly the channel and components it pins,
+        # rather than whatever `stable` resolves to on the day the job
+        # runs — which matters because clippy's lint set moves between
+        # releases and this job treats a warning as a failure.
+        run: rustup show
+
+      - name: Cache the cargo registry and build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install native dependencies
+        # The `*-sys` crates in this crate's graph, confirmed with
+        # `cargo tree --edges normal,build` rather than assumed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo clippy --all-targets -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: "cargo test (tier 1 only)"
+        run: cargo test --all-targets

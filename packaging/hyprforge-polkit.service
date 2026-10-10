@@ -1,0 +1,23 @@
+[Unit]
+Description=Hyprforge polkit authentication agent
+PartOf=graphical-session.target
+After=graphical-session.target
+# Each prompt opens its own Wayland connection, so there is nothing to
+# draw on outside a graphical session — the same condition
+# hyprpolkitagent's unit has.
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/hyprforge-polkit
+Slice=session.slice
+Restart=on-failure
+RestartSec=2
+# 3 is "polkit refused to register: another agent answers this session".
+# Restarting cannot change that — only stopping the other agent can,
+# which Settings -> Set up's "Administrator prompts" does — so it is not
+# retried every two seconds into the journal.
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=graphical-session.target
