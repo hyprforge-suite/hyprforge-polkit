@@ -1,0 +1,53 @@
+[package]
+name = "hyprforge-polkit"
+version = "0.1.10"
+edition = "2021"
+license = "MIT"
+description = "A polkit authentication agent for Hyprland: the prompt for administrator access, drawn in the suite's look, relaying polkit's own PAM conversation — password, and fingerprint where the system's PAM stack offers it."
+repository = "https://github.com/hyprforge-suite/hyprforge-polkit"
+readme = "README.md"
+keywords = ["hyprland", "polkit", "authentication", "linux"]
+categories = ["os::linux-apis", "authentication"]
+# A component, not a library: nothing here is meant to be depended on,
+# and crates.io is where the suite's libraries live.
+publish = false
+
+[[bin]]
+name = "hyprforge-polkit"
+path = "src/main.rs"
+
+[dependencies]
+# polkitd is on the system bus; the agent registers there and serves
+# BeginAuthentication / CancelAuthentication. On tokio for the same
+# reason every D-Bus client in the suite is: zbus's own executor runs
+# handlers outside any runtime.
+zbus = { version = "5.18", default-features = false, features = ["tokio"] }
+# "net" for the helper's Unix socket, "io-util" to read its lines,
+# "process" for the setuid fallback when the socket is absent.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# By crates.io version, as every component names its siblings — see the
+# suite's CLAUDE.md on `[patch.crates-io]`.
+#
+# The prompt is a popup like the clipboard's: the shared layer-shell
+# shell, its inbox (so the conversation can update an open prompt), and
+# the one theme.
+hyprforge-popup = "0.1"
+hyprforge-appearance = "0.1"
+hyprforge-look = "0.1"
+# What was typed lives in a Secret, whose Debug is a length and which
+# zeroes itself on drop.
+hyprforge-secret = "0.1"
+
+iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["wayland"] }
+iced_runtime = "0.14"
+iced_widget = "0.14"
+iced_renderer = { version = "0.14", default-features = false, features = ["tiny-skia"] }
+
+[dev-dependencies]
+tempfile = "3"
+# The ignored render test only: draws the card to a PNG to look at.
+tiny-skia = "0.11"
