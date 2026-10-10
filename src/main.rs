@@ -14,6 +14,24 @@ mod window;
 
 use std::sync::Arc;
 
+/// The exit status when polkit refuses to register this agent because
+/// another one answers for the session. The unit does not restart on it
+/// (`RestartPreventExitStatus=3`): retrying cannot change the answer.
+const ANOTHER_AGENT: u8 = 3;
+
+/// Registration was refused — the one failure that has its own exit
+/// status.
+#[derive(Debug)]
+struct Refused(anyhow::Error);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
@@ -25,7 +43,11 @@ async fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
-            std::process::ExitCode::FAILURE
+            if e.is::<Refused>() {
+                std::process::ExitCode::from(ANOTHER_AGENT)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
     }
 }
@@ -39,7 +61,10 @@ async fn run() -> anyhow::Result<()> {
     // hyprpolkitagent, say. Said plainly, because it is the one failure a
     // person can fix by themselves.
     agent::register(&system, &session).await.map_err(|e| {
-        anyhow::anyhow!("polkit refused to register this agent for session {session}: {e} — is another agent (hyprpolkitagent?) already running?")
+        anyhow::Error::new(Refused(anyhow::anyhow!(
+            "polkit refused to register this agent for session {session}: {e} — is another agent (hyprpolkitagent?) already running? \
+             Settings -> Set up -> \"Administrator prompts\" replaces it"
+        )))
     })?;
     tracing::info!("answering polkit for session {session}");
     std::future::pending::<()>().await;

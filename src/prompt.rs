@@ -294,6 +294,20 @@ impl Layout {
         }
     }
 
+    /// The same card, centred on a surface `width` by `height` — the
+    /// whole monitor, behind which the backdrop dims the desktop.
+    pub fn on(self, width: f64, height: f64) -> Layout {
+        let width = width.max(self.width);
+        let height = height.max(self.height);
+        Layout {
+            width,
+            height,
+            card_x: ((width - self.card_w) / 2.0).round(),
+            card_y: ((height - self.card_h) / 2.0).round(),
+            ..self
+        }
+    }
+
     /// The width a line of the message has, for measuring it.
     pub fn message_width(u: f32) -> f32 {
         ((CARD_W - 2.0 * PAD_SIDE) as f32) * u
@@ -440,6 +454,12 @@ impl PopupApp for PromptApp {
         Dismissal::HoldKeyboard
     }
 
+    /// Its own, so a layer rule can blur behind this prompt and no other
+    /// popup — Set up's "Blur behind administrator prompts".
+    fn namespace(&self) -> &'static str {
+        NAMESPACE
+    }
+
     fn needs_finish(_outcome: Closed) -> bool {
         false
     }
@@ -458,6 +478,17 @@ impl Receives<Message> for PromptApp {
         }
     }
 }
+
+/// The prompt's layer namespace, which Set up's blur rule matches.
+pub const NAMESPACE: &str = "hyprforge-polkit";
+
+/// How much of the theme's background lies over the desktop behind the
+/// card. The lock card is glass over a blurred wallpaper; here it would
+/// be glass over whatever windows are open, and text in them reads
+/// through it. Dimming them (and, with the layer rule, blurring them)
+/// gives the glass the quiet ground it was designed on — and says, as an
+/// administrator prompt should, that this is the one thing to answer.
+const BACKDROP: f32 = 0.45;
 
 type El<'a> = Element<'a, Infallible, iced_widget::Theme, iced_tiny_skia::Renderer>;
 
@@ -552,10 +583,12 @@ pub(crate) fn view<'a>(model: &'a Model, layout: &Layout, theme: &'a Theme, hove
         layout.card_w as f32,
         Padding { top: PAD_TOP as f32 * u, right: PAD_SIDE as f32 * u, bottom: PAD_BOTTOM as f32 * u, left: PAD_SIDE as f32 * u },
     );
+    let backdrop = fade(theme.background, BACKDROP);
     container(panel)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(Padding { top: layout.card_y as f32, left: layout.card_x as f32, right: 0.0, bottom: 0.0 })
+        .style(move |_: &iced_widget::Theme| container::Style { background: Some(backdrop.into()), ..Default::default() })
         .into()
 }
 
@@ -688,6 +721,23 @@ mod tests {
             assert!(l.card_y + l.card_h <= l.height && l.card_x + l.card_w <= l.width, "room for the shadow");
         }
         assert!(Layout::new(1.0, 2, false).switch().is_none());
+    }
+
+    /// On the monitor the card is centred, and every hit area moves with
+    /// it — they are read from the same layout.
+    #[test]
+    fn on_a_monitor_the_card_is_centred_and_its_buttons_follow() {
+        let card = Layout::new(1.0, 2, false);
+        let screen = card.on(1600.0, 1000.0);
+        assert_eq!((screen.width, screen.height), (1600.0, 1000.0));
+        assert!((screen.card_x + screen.card_w / 2.0 - 800.0).abs() <= 1.0);
+        assert!((screen.card_y + screen.card_h / 2.0 - 500.0).abs() <= 1.0);
+        let (before, after) = (card.authenticate(), screen.authenticate());
+        assert!((after.x - before.x - (screen.card_x - card.card_x)).abs() < 1e-6);
+        assert!((after.y - before.y - (screen.card_y - card.card_y)).abs() < 1e-6);
+        // A monitor smaller than the card still holds all of it.
+        let tiny = card.on(10.0, 10.0);
+        assert!(tiny.card_x >= 0.0 && tiny.card_y >= 0.0);
     }
 
     /// Draws the prompt to `$SHOTS/<name>.png` in a few states, to look

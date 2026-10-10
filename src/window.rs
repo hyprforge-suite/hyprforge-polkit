@@ -1,5 +1,5 @@
-//! Opening the real prompt: a popup on its own thread, centred on the
-//! monitor the pointer is on.
+//! Opening the real prompt: a popup on its own thread, covering the
+//! monitor the pointer is on, with the card in the middle of it.
 //!
 //! Each prompt is its own Wayland connection, opened when it is needed
 //! and closed with it, so an agent that sits idle all day holds nothing
@@ -27,7 +27,7 @@ impl Prompts for Wayland {
         let u = hyprforge_authui::screen::unit(&theme);
         let lines = message_lines(&request.message, 13.0 * u, Layout::message_width(u), hyprforge_authui::screen::font(&theme));
         let layout = Layout::new(u, lines, request.users.len() > 1);
-        let placement = centred(layout).ok_or_else(|| std::io::Error::other("no monitor to show the prompt on"))?;
+        let (placement, layout) = covering(layout).ok_or_else(|| std::io::Error::other("no monitor to show the prompt on"))?;
         let connection = Connection::connect_to_env().map_err(std::io::Error::other)?;
         let (tell, inbox) = hyprforge_popup::inbox();
         let app = PromptApp::new(Model::new(request), layout, did.clone());
@@ -66,19 +66,22 @@ fn message_lines(message: &str, font_size: f32, width: f32, font: Font) -> usize
     (paragraph.min_bounds().height / line).round().max(1.0) as usize
 }
 
-/// The middle of the monitor the pointer is on — where the person is
-/// looking — or the first monitor when the pointer cannot be found.
-fn centred(layout: Layout) -> Option<Placement> {
+/// All of the monitor the pointer is on — where the person is looking —
+/// or the first monitor when the pointer cannot be found; and the card's
+/// layout centred on it.
+fn covering(layout: Layout) -> Option<(Placement, Layout)> {
     let monitors = hyprforge_popup::monitors();
     let pointer: Option<Point> = hyprforge_popup::cursor_position();
     let monitor = pointer
         .and_then(|p| hyprforge_popup::geometry::monitor_at(&monitors, p))
         .or_else(|| monitors.first())?;
-    Some(Placement {
+    let layout = layout.on(monitor.size.width.floor(), monitor.size.height.floor());
+    let placement = Placement {
         output_name: monitor.name.clone(),
-        margin_left: ((monitor.size.width - layout.width) / 2.0).max(0.0).round() as i32,
-        margin_top: ((monitor.size.height - layout.height) / 2.0).max(0.0).round() as i32,
-        width: layout.width.round() as u32,
-        height: layout.height.round() as u32,
-    })
+        margin_left: 0,
+        margin_top: 0,
+        width: layout.width as u32,
+        height: layout.height as u32,
+    };
+    Some((placement, layout))
 }
