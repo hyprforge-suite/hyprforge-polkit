@@ -21,7 +21,7 @@
 //! [`Connector`] is the seam. Tests never reach either: the PAM stack on
 //! the machine this was written on locks the account after three wrong
 //! passwords (pam_faillock), so a test that typed a wrong one at the real
-//! helper would be locking out the person running it. [`script`] is the
+//! helper would be locking out the person running it. `script` (test builds only) is the
 //! stand-in they use instead.
 
 use crate::line::{Line, Unknown};
