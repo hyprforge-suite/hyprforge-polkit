@@ -1,13 +1,19 @@
 //! The prompt: what a person sees when an application asks for
 //! administrator access.
 //!
-//! A card in the suite's look, centred on the monitor the pointer is on,
-//! holding the keyboard for as long as it is up — a password typed while
-//! it is open must never land in the window behind it. Its parts, top to
-//! bottom: what is being asked for (polkit's own `message`, which the
-//! action's author wrote for people), who is answering (the person at
-//! the session first; arrows when polkit allows others), the field, a
-//! line for what PAM last said, and Cancel / Authenticate.
+//! It is the lock screen's card. The panel, the avatar, the name, the
+//! field of dots and the line under it — layout and Caps Lock, or what
+//! went wrong — are drawn by `hyprforge-authui`'s own `card_body` and
+//! `glass_panel`, not a copy of them, so the two prompts for a password
+//! on this desktop cannot drift apart. What a polkit prompt needs beyond
+//! the lock's is above and below the card's body: what is being asked
+//! for, in polkit's own words (the action's author wrote them for
+//! people), and Cancel / Authenticate.
+//!
+//! The state the card is drawn from is authui's own conversation state,
+//! so it behaves as the lock does too: a failure stays on screen until
+//! the person starts typing again, and checking keeps the dots that were
+//! sent.
 //!
 //! Three rules from the suite's CLAUDE.md shape the input handling:
 //!
@@ -15,19 +21,23 @@
 //!   to recognise Enter, Escape, Backspace and the arrows; a character
 //!   comes from the text the press produced, so Shift and AltGr give the
 //!   character the person meant and PAM sees the password they typed.
-//! - **Nothing derived from a keystroke is logged.** The field is a
-//!   `Secret`; its Debug is a length.
+//! - **Nothing derived from a keystroke is logged.** What was typed is a
+//!   `Secret`, inside authui's `State`; its Debug is a length.
 //! - **The thing drawn and the thing hit-tested are one layout.**
 //!   [`Layout`] is read by both [`view`] and [`PromptApp::pointer_click`].
 
 use crate::conversation::{Did, Shown};
+use hyprforge_authui::conversation::{Prompt, State};
+use hyprforge_authui::scene::{self, Scene};
+use hyprforge_authui::screen;
 use hyprforge_look::Theme;
-use hyprforge_popup::kit::{self, Look};
+use hyprforge_popup::kit::to_iced;
 use hyprforge_popup::{Dismissal, Keysym, Modifiers, PopupApp, Receives};
 use hyprforge_secret::Secret;
 use iced_runtime::core::alignment::{Horizontal, Vertical};
+use iced_runtime::core::font::Weight;
 use iced_runtime::core::text::Wrapping;
-use iced_runtime::core::{Border, Element, Length, Padding};
+use iced_runtime::core::{Border, Color, Element, Font, Length, Padding};
 use iced_widget::{column, container, row, text, Space};
 use std::convert::Infallible;
 use tokio::sync::mpsc::UnboundedSender;
@@ -44,26 +54,20 @@ pub struct Request {
     pub users: Vec<String>,
 }
 
-/// Everything the prompt shows, and nothing it does not.
+/// Everything the prompt shows.
 #[derive(Debug)]
 pub struct Model {
     pub request: Request,
     /// Which of `request.users` is answering.
     pub user: usize,
-    field: Secret<String>,
-    /// PAM's current question, if it has asked one — `None` while
-    /// pam_fprintd is waiting for a finger, which is exactly when the
-    /// field must say so rather than look broken.
-    asking: Option<(String, bool)>,
-    /// What PAM last said: an error, or something to know.
-    said: Option<Said>,
-    checking: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Said {
-    Info(String),
-    Error(String),
+    /// What the card draws: authui's conversation state.
+    state: State,
+    /// PAM's open question, kept while a failure is still on screen so
+    /// the first character typed can reopen it.
+    prompt: Option<Prompt>,
+    /// How many dots to keep showing while an answer is checked.
+    submitted: usize,
+    pub caps_lock: bool,
 }
 
 /// What a key press or a click asks the conversation to do.
@@ -74,47 +78,56 @@ pub enum Action {
     Cancel,
 }
 
+const TRY_AGAIN: &str = "That didn't work. Try again.";
+
 impl Model {
     pub fn new(request: Request) -> Model {
-        Model {
-            request,
-            user: 0,
-            field: Secret::new(String::new()),
-            asking: None,
-            said: None,
-            checking: false,
-        }
+        Model { request, user: 0, state: State::Working, prompt: None, submitted: 0, caps_lock: false }
     }
 
     pub fn user(&self) -> &str {
         self.request.users.get(self.user).map(String::as_str).unwrap_or("")
     }
 
-    /// How many characters are in the field — all that is ever exposed
-    /// about it outside [`Self::submit`].
+    #[cfg(test)]
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// How many characters have been typed — all that is ever exposed
+    /// about the answer outside [`Self::submit`].
     pub fn typed(&self) -> usize {
-        self.field.expose().chars().count()
+        match &self.state {
+            State::Asking { entered, .. } => entered.expose().chars().count(),
+            _ => 0,
+        }
     }
 
     /// The conversation moved on.
     pub fn shown(&mut self, shown: Shown) {
         match shown {
             Shown::Ask { text, echo } => {
-                self.asking = Some((text, echo));
-                self.checking = false;
+                let prompt = Prompt { text, secret: !echo };
+                self.prompt = Some(prompt.clone());
+                // A failure stays until the person types, as on the lock.
+                if !matches!(self.state, State::Failed { .. }) {
+                    self.state = State::Asking { prompt, entered: Secret::new(String::new()) };
+                }
             }
-            Shown::Info(text) => self.said = Some(Said::Info(text)),
-            Shown::Error(text) => self.said = Some(Said::Error(text)),
-            Shown::Checking => self.checking = true,
-            // The helper's own error line ("Authentication failure")
-            // already said why; a try that failed with nothing said
-            // still needs a sentence.
+            // Said while nothing is being asked — pam_fprintd's "Place
+            // your finger…". While a question is open the field is the
+            // thing to look at, and the line under it shows Caps Lock.
+            Shown::Info(text) => {
+                if !matches!(self.state, State::Asking { .. }) {
+                    self.state = State::Telling { text, error: false };
+                }
+            }
+            Shown::Error(reason) => self.state = State::Failed { reason },
+            Shown::Checking => self.state = State::Working,
             Shown::TryAgain => {
-                self.checking = false;
-                self.asking = None;
-                self.field = Secret::new(String::new());
-                if !matches!(self.said, Some(Said::Error(_))) {
-                    self.said = Some(Said::Error("That didn't work. Try again.".into()));
+                self.prompt = None;
+                if !matches!(self.state, State::Failed { .. }) {
+                    self.state = State::Failed { reason: TRY_AGAIN.into() };
                 }
             }
         }
@@ -122,30 +135,48 @@ impl Model {
 
     /// Whether Authenticate would do anything now.
     pub fn can_submit(&self) -> bool {
-        self.asking.is_some() && !self.checking
+        matches!(self.state, State::Asking { .. })
     }
 
     fn submit(&mut self) -> Option<Action> {
         if !self.can_submit() {
             return None;
         }
-        // Moved out, not copied: the field starts empty again and the
-        // only copy of the answer goes to the helper.
-        let answer = std::mem::replace(&mut self.field, Secret::new(String::new()));
-        self.said = None;
-        Some(Action::Answer(answer))
+        // Moved out, not copied: the only copy of the answer goes to the
+        // helper, and the card shows dots for it while it is checked.
+        let State::Asking { entered, .. } = std::mem::replace(&mut self.state, State::Working) else {
+            return None;
+        };
+        self.submitted = entered.expose().chars().count();
+        Some(Action::Answer(entered))
     }
 
     fn switch(&mut self, by: isize) -> Option<Action> {
         let count = self.request.users.len();
-        if count < 2 || self.checking {
+        if count < 2 || matches!(self.state, State::Working) && self.prompt.is_some() {
             return None;
         }
         self.user = (self.user as isize + by).rem_euclid(count as isize) as usize;
-        self.asking = None;
-        self.said = None;
-        self.field = Secret::new(String::new());
+        self.prompt = None;
+        self.state = State::Working;
         Some(Action::SwitchTo(self.user().to_owned()))
+    }
+
+    fn type_text(&mut self, typed: &str) {
+        match &mut self.state {
+            State::Asking { entered, .. } => {
+                let mut longer = entered.expose().clone();
+                longer.push_str(typed);
+                *entered = Secret::new(longer);
+            }
+            // Typing again is what takes a failure off the screen.
+            State::Failed { .. } => {
+                if let Some(prompt) = self.prompt.clone() {
+                    self.state = State::Asking { prompt, entered: Secret::new(typed.to_owned()) };
+                }
+            }
+            _ => {}
+        }
     }
 
     /// One key press: `keysym` for the keys that are not text, `utf8`
@@ -155,10 +186,10 @@ impl Model {
             Keysym::Return | Keysym::KP_Enter => return self.submit(),
             Keysym::Escape => return Some(Action::Cancel),
             Keysym::BackSpace => {
-                if !self.checking {
-                    let mut kept = self.field.expose().clone();
+                if let State::Asking { entered, .. } = &mut self.state {
+                    let mut kept = entered.expose().clone();
                     kept.pop();
-                    self.field = Secret::new(kept);
+                    *entered = Secret::new(kept);
                 }
                 return None;
             }
@@ -170,29 +201,35 @@ impl Model {
         // ("\r", "\u{1b}", "\u{8}") and must never reach a password; a
         // control character of any kind is not something typed.
         let typed: String = utf8.unwrap_or("").chars().filter(|c| !c.is_control()).collect();
-        if !typed.is_empty() && !self.checking {
-            let mut longer = self.field.expose().clone();
-            longer.push_str(&typed);
-            self.field = Secret::new(longer);
+        if !typed.is_empty() {
+            self.type_text(&typed);
         }
         None
     }
 }
 
-/// Where everything is, in logical pixels — read by the drawing and the
-/// hit-testing alike.
+/// Where everything is, in logical pixels on the popup's surface — read
+/// by the drawing and the hit-testing alike.
+///
+/// The card is the lock's, 380 units wide; around it, transparent room
+/// for its shadow, which is drawn outside the panel (20 down, a 50 blur).
+/// The card's height is fixed and its body given a fixed box sized from
+/// authui's own measures — avatar 72, name, field 46, the line under it,
+/// and the spacing between — so Authenticate is exactly where the
+/// hit-test looks for it whatever the body draws.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
+    /// authui's unit: the theme's font size over ten, bounded.
+    pub u: f64,
     pub width: f64,
     pub height: f64,
-    pub padding: f64,
-    pub title: f64,
-    pub message: f64,
-    pub user: f64,
-    pub field: f64,
-    pub said: f64,
-    pub buttons: f64,
-    pub gap: f64,
+    pub card_x: f64,
+    pub card_y: f64,
+    pub card_w: f64,
+    pub card_h: f64,
+    pub header: f64,
+    pub body: f64,
+    pub several: bool,
 }
 
 /// A rectangle, for hit-testing.
@@ -210,73 +247,87 @@ impl Rect {
     }
 }
 
-pub const WIDTH: f64 = 440.0;
-const BUTTON_W: f64 = 120.0;
-const BUTTON_GAP: f64 = 8.0;
-const ARROW_W: f64 = 28.0;
+// In authui's units.
+const CARD_W: f64 = 380.0;
+const PAD_TOP: f64 = 26.0;
+const PAD_SIDE: f64 = 28.0;
+const PAD_BOTTOM: f64 = 22.0;
+const TITLE: f64 = 15.0;
+const MESSAGE: f64 = 13.0;
+const LINE: f64 = 1.3;
+/// authui's `card_body`: avatar 72, gap 10, the name (17 with its lift),
+/// gap 18, field 46, gap 18, the line under it (11) — and a little over.
+const BODY: f64 = 72.0 + 10.0 + 24.0 + 18.0 + 46.0 + 18.0 + 15.0 + 4.0;
+const HEADER_GAP: f64 = 20.0;
+const SWITCH: f64 = 22.0;
+const SWITCH_GAP: f64 = 6.0;
+const BUTTONS_GAP: f64 = 22.0;
+const BUTTONS: f64 = 38.0;
+const BUTTON_GAP: f64 = 10.0;
+const SHADOW_SIDE: f64 = 40.0;
+const SHADOW_TOP: f64 = 24.0;
+const SHADOW_BOTTOM: f64 = 64.0;
 
 impl Layout {
-    /// The layout for a message `message_lines` lines tall at
-    /// `font_size`. The line count is measured by the caller (see
-    /// `crate::fit`), because only the shaper knows where a sentence wraps.
-    pub fn new(font_size: f32, message_lines: usize) -> Layout {
-        let f = f64::from(font_size);
-        let line = f * 1.35;
-        let mut layout = Layout {
-            width: WIDTH,
-            height: 0.0,
-            padding: 20.0,
-            title: (f * 1.25 * 1.35).ceil(),
-            message: (line * message_lines.clamp(1, 4) as f64).ceil(),
-            user: (f * 2.4).ceil(),
-            field: (f * 2.5).ceil(),
-            said: line.ceil(),
-            buttons: (f * 2.4).ceil(),
-            gap: 12.0,
-        };
-        layout.height = layout.padding * 2.0
-            + layout.title
-            + 6.0
-            + layout.message
-            + layout.gap
-            + layout.user
-            + layout.gap
-            + layout.field
-            + 6.0
-            + layout.said
-            + layout.gap
-            + layout.buttons;
-        layout
+    /// The layout at authui's unit `u`, for a message `message_lines`
+    /// long (measured by the caller, because only the shaper knows where
+    /// a sentence wraps), with the identity switch when `several` may
+    /// answer.
+    pub fn new(u: f32, message_lines: usize, several: bool) -> Layout {
+        let u = f64::from(u);
+        let header = (TITLE * LINE + 6.0 + MESSAGE * LINE * message_lines.clamp(1, 4) as f64) * u;
+        let body = BODY * u;
+        let switch = if several { (SWITCH_GAP + SWITCH) * u } else { 0.0 };
+        let card_h = (PAD_TOP + HEADER_GAP + BUTTONS_GAP + BUTTONS + PAD_BOTTOM) * u + header + body + switch;
+        let card_w = CARD_W * u;
+        Layout {
+            u,
+            width: card_w + 2.0 * SHADOW_SIDE * u,
+            height: card_h + (SHADOW_TOP + SHADOW_BOTTOM) * u,
+            card_x: SHADOW_SIDE * u,
+            card_y: SHADOW_TOP * u,
+            card_w,
+            card_h,
+            header,
+            body,
+            several,
+        }
     }
 
-    fn inner(&self) -> f64 {
-        self.width - self.padding * 2.0
+    /// The width a line of the message has, for measuring it.
+    pub fn message_width(u: f32) -> f32 {
+        ((CARD_W - 2.0 * PAD_SIDE) as f32) * u
     }
 
-    fn user_top(&self) -> f64 {
-        self.padding + self.title + 6.0 + self.message + self.gap
+    fn inner_w(&self) -> f64 {
+        self.card_w - 2.0 * PAD_SIDE * self.u
     }
 
-    fn buttons_top(&self) -> f64 {
-        self.height - self.padding - self.buttons
+    fn button_w(&self) -> f64 {
+        (self.inner_w() - BUTTON_GAP * self.u) / 2.0
     }
 
-    /// Authenticate, at the right; Cancel to its left.
-    pub fn authenticate(&self) -> Rect {
-        Rect { x: self.width - self.padding - BUTTON_W, y: self.buttons_top(), w: BUTTON_W, h: self.buttons }
+    fn buttons_y(&self) -> f64 {
+        self.card_y + self.card_h - (PAD_BOTTOM + BUTTONS) * self.u
     }
 
     pub fn cancel(&self) -> Rect {
-        Rect { x: self.width - self.padding - BUTTON_W * 2.0 - BUTTON_GAP, y: self.buttons_top(), w: BUTTON_W, h: self.buttons }
+        Rect { x: self.card_x + PAD_SIDE * self.u, y: self.buttons_y(), w: self.button_w(), h: BUTTONS * self.u }
     }
 
-    /// The arrows either side of the name, when there is a choice.
-    pub fn previous_user(&self) -> Rect {
-        Rect { x: self.padding, y: self.user_top(), w: ARROW_W, h: self.user }
+    pub fn authenticate(&self) -> Rect {
+        let cancel = self.cancel();
+        Rect { x: cancel.x + cancel.w + BUTTON_GAP * self.u, ..cancel }
     }
 
-    pub fn next_user(&self) -> Rect {
-        Rect { x: self.padding + self.inner() - ARROW_W, y: self.user_top(), w: ARROW_W, h: self.user }
+    /// "Use another account", under the card's body, when there is one.
+    pub fn switch(&self) -> Option<Rect> {
+        self.several.then(|| Rect {
+            x: self.card_x + PAD_SIDE * self.u,
+            y: self.card_y + (PAD_TOP + HEADER_GAP + SWITCH_GAP) * self.u + self.header + self.body,
+            w: self.inner_w(),
+            h: SWITCH * self.u,
+        })
     }
 }
 
@@ -295,13 +346,14 @@ pub struct PromptApp {
     pub model: Model,
     layout: Layout,
     did: UnboundedSender<Did>,
-    hovered: Option<Button>,
+    hovered: Option<Hot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Button {
+pub(crate) enum Hot {
     Cancel,
     Authenticate,
+    Switch,
 }
 
 /// How a prompt ended — only ever because it was told to, or because the
@@ -333,11 +385,13 @@ impl PromptApp {
         }
     }
 
-    fn button_at(&self, position: (f64, f64)) -> Option<Button> {
+    fn hot_at(&self, position: (f64, f64)) -> Option<Hot> {
         if self.layout.cancel().contains(position) {
-            Some(Button::Cancel)
+            Some(Hot::Cancel)
         } else if self.layout.authenticate().contains(position) {
-            Some(Button::Authenticate)
+            Some(Hot::Authenticate)
+        } else if self.layout.switch().is_some_and(|r| r.contains(position)) {
+            Some(Hot::Switch)
         } else {
             None
         }
@@ -348,7 +402,7 @@ impl PopupApp for PromptApp {
     type Outcome = Closed;
 
     fn view<'a>(&'a mut self, theme: &'a Theme, _now: u64, _width: f64) -> Element<'a, Infallible, iced_widget::Theme, iced_tiny_skia::Renderer> {
-        view(&self.model, &self.layout, &Look::new(theme), self.hovered)
+        view(&self.model, &self.layout, theme, self.hovered)
     }
 
     fn rows_that_fit(&self, _theme: &Theme, _height: f64) -> usize {
@@ -356,18 +410,17 @@ impl PopupApp for PromptApp {
     }
 
     fn pointer_move(&mut self, _theme: &Theme, position: (f64, f64)) -> bool {
-        let hovered = self.button_at(position);
+        let hovered = self.hot_at(position);
         let changed = hovered != self.hovered;
         self.hovered = hovered;
         changed
     }
 
     fn pointer_click(&mut self, _theme: &Theme, _width: f64, position: (f64, f64)) -> Option<Closed> {
-        let action = match self.button_at(position) {
-            Some(Button::Cancel) => Some(Action::Cancel),
-            Some(Button::Authenticate) => self.model.submit(),
-            None if self.layout.previous_user().contains(position) => self.model.switch(-1),
-            None if self.layout.next_user().contains(position) => self.model.switch(1),
+        let action = match self.hot_at(position) {
+            Some(Hot::Cancel) => Some(Action::Cancel),
+            Some(Hot::Authenticate) => self.model.submit(),
+            Some(Hot::Switch) => self.model.switch(1),
             None => None,
         };
         self.act(action)
@@ -375,7 +428,10 @@ impl PopupApp for PromptApp {
 
     fn pointer_scroll(&mut self, _rows: i32) {}
 
-    fn key(&mut self, keysym: Keysym, utf8: Option<String>, _modifiers: Modifiers) -> Option<Closed> {
+    fn key(&mut self, keysym: Keysym, utf8: Option<String>, modifiers: Modifiers) -> Option<Closed> {
+        // Not a nicety: where pam_faillock counts, a stuck Caps Lock
+        // spends a try. Learned from the press, as the lock does.
+        self.model.caps_lock = modifiers.caps_lock;
         let action = self.model.key(keysym, utf8.as_deref());
         self.act(action)
     }
@@ -403,133 +459,104 @@ impl Receives<Message> for PromptApp {
     }
 }
 
-fn alpha(c: iced_runtime::core::Color, a: f32) -> iced_runtime::core::Color {
-    iced_runtime::core::Color { a, ..c }
-}
-
 type El<'a> = Element<'a, Infallible, iced_widget::Theme, iced_tiny_skia::Renderer>;
 
-/// The card.
-pub(crate) fn view<'a>(model: &'a Model, layout: &Layout, look: &Look, hovered: Option<Button>) -> El<'a> {
-    let look = *look;
-    let f = look.font_size;
+fn fade(c: hyprforge_look::Color, alpha: f32) -> Color {
+    let c = to_iced(c);
+    Color { a: c.a * alpha, ..c }
+}
 
-    let title: El = text("Authentication required").size(f * 1.25).font(kit::strong()).color(look.text).into();
-    let message: El = container(text(model.request.message.as_str()).size(f).color(look.dim).wrapping(Wrapping::Word))
-        .height(Length::Fixed(layout.message as f32))
-        .clip(true)
-        .into();
+/// The prompt: the lock's card, with the request above its body and the
+/// buttons below.
+pub(crate) fn view<'a>(model: &'a Model, layout: &Layout, theme: &'a Theme, hovered: Option<Hot>) -> El<'a> {
+    let u = layout.u as f32;
+    let fg = to_iced(theme.foreground);
+    let font = screen::font(theme);
+    let medium = Font { weight: Weight::Medium, ..font };
+    let strong = Font { weight: Weight::Semibold, ..font };
 
-    // Who is answering: an initial in the accent, the name, and arrows
-    // when polkit allows more than one.
-    let several = model.request.users.len() > 1;
-    let initial = model.user().chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-    let side = (layout.user * 0.8) as f32;
-    let avatar = container(text(initial).size(f).font(kit::strong()).color(look.on_accent))
-        .width(Length::Fixed(side))
-        .height(Length::Fixed(side))
-        .align_x(Horizontal::Center)
-        .align_y(Vertical::Center)
-        .style(move |_: &iced_widget::Theme| container::Style {
-            background: Some(look.accent.into()),
-            border: Border { radius: (side / 2.0).into(), ..Default::default() },
-            ..Default::default()
-        });
-    let arrow = |glyph: &'static str| -> El {
-        let label: El = if several { text(glyph).size(f * 1.2).color(look.dim).into() } else { Space::new().into() };
-        container(label)
-            .width(Length::Fixed(ARROW_W as f32))
-            .height(Length::Fixed(layout.user as f32))
-            .align_x(Horizontal::Center)
-            .align_y(Vertical::Center)
-            .into()
-    };
-    let who = row![
-        arrow("\u{2039}"),
-        Space::new().width(Length::Fill),
-        avatar,
-        text(model.user().to_owned()).size(f).color(look.text),
-        Space::new().width(Length::Fill),
-        arrow("\u{203a}"),
+    let header = column![
+        text("Authentication required").size(TITLE as f32 * u).font(strong).color(fg),
+        text(model.request.message.as_str())
+            .size(MESSAGE as f32 * u)
+            .font(font)
+            .color(fade(theme.foreground, 0.7))
+            .wrapping(Wrapping::Word)
+            .align_x(Horizontal::Center),
     ]
-    .spacing(10)
-    .align_y(Vertical::Center)
-    .height(Length::Fixed(layout.user as f32));
+    .spacing(6.0 * u)
+    .align_x(iced_runtime::core::Alignment::Center)
+    .width(Length::Fill);
+    let header = container(header).width(Length::Fill).height(Length::Fixed(layout.header as f32)).clip(true);
 
-    // The field: dots for a password, the text for an echoed answer, and
-    // what PAM is doing when it has not asked yet.
-    let (shown, colour) = match &model.asking {
-        None => ("Waiting\u{2026}".to_string(), look.dim),
-        Some(_) if model.checking => ("Checking\u{2026}".to_string(), look.dim),
-        Some((prompt, _)) if model.typed() == 0 => (prompt.trim().trim_end_matches(':').to_string(), look.dim),
-        Some((_, true)) => (model.field.expose().clone(), look.text),
-        Some((_, false)) => ("\u{2022}".repeat(model.typed()), look.text),
-    };
-    let field_h = layout.field;
-    let radius = look.radius_for(field_h, 8.0);
-    let field = container(text(shown).size(f).color(colour).wrapping(Wrapping::None))
-        .width(Length::Fill)
-        .height(Length::Fixed(field_h as f32))
-        .padding(Padding { top: 0.0, right: 12.0, bottom: 0.0, left: 12.0 })
-        .align_y(Vertical::Center)
-        .clip(true)
-        .style(move |_: &iced_widget::Theme| container::Style {
-            background: Some(alpha(look.inset, 0.6).into()),
-            border: Border { radius: radius.into(), width: 1.0, color: look.accent },
-            ..Default::default()
-        });
+    // The lock's own card body, from a scene of this conversation.
+    let mut scene = Scene::new(&model.state, model.user(), theme, chrono::Local::now());
+    scene.caps_lock = model.caps_lock;
+    scene.submitted = model.submitted;
+    let body: El = screen::card_body::<iced_tiny_skia::Renderer>(&scene)
+        // The card body sends no Action — authui says so where it makes
+        // it public: the controls that do are not part of it.
+        .map(|_: scene::Action| -> Infallible { unreachable!("authui's card body has no controls") });
+    let body = container(body).width(Length::Fill).height(Length::Fixed(layout.body as f32)).align_x(Horizontal::Center);
 
-    let said: El = match &model.said {
-        Some(Said::Error(t)) => text(t.as_str()).size(look.small()).color(look.error).wrapping(Wrapping::None).into(),
-        Some(Said::Info(t)) => text(t.as_str()).size(look.small()).color(look.info).wrapping(Wrapping::None).into(),
-        None => Space::new().into(),
-    };
-    let said = container(said).height(Length::Fixed(layout.said as f32)).clip(true);
+    let mut card = column![header, Space::new().height(Length::Fixed(HEADER_GAP as f32 * u)), body].width(Length::Fill);
+    if layout.several {
+        let hot = hovered == Some(Hot::Switch);
+        card = card.push(Space::new().height(Length::Fixed(SWITCH_GAP as f32 * u)));
+        card = card.push(
+            container(
+                text(format!("Not {}? Use another account", scene::display_name(model.user())))
+                    .size(12.0 * u)
+                    .font(font)
+                    .color(fade(theme.foreground, if hot { 0.95 } else { 0.6 })),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(SWITCH as f32 * u))
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center),
+        );
+    }
+    card = card.push(Space::new().height(Length::Fill));
 
     let button = |label: &'static str, primary: bool, hot: bool, enabled: bool| -> El {
-        let h = layout.buttons;
-        let r = look.radius_for(h, 8.0);
-        let fill = match (primary, enabled) {
-            (true, true) => Some(if hot { alpha(look.accent, 0.85) } else { look.accent }),
-            (true, false) => Some(alpha(look.accent, 0.35)),
-            (false, _) => hot.then_some(look.selected),
+        let radius = 12.0 * u;
+        let (fill, edge, ink) = match (primary, enabled) {
+            (true, true) => (fade(theme.accent, if hot { 0.85 } else { 1.0 }), Color::TRANSPARENT, to_iced(theme.background)),
+            (true, false) => (fade(theme.accent, 0.35), Color::TRANSPARENT, fade(theme.background, 0.8)),
+            (false, _) => (fade(theme.background, if hot { 0.75 } else { 0.5 }), fade(theme.foreground, 0.14), fg),
         };
-        let fg = if primary { look.on_accent } else { look.text };
-        container(text(label).size(f).color(fg))
-            .width(Length::Fixed(BUTTON_W as f32))
-            .height(Length::Fixed(h as f32))
+        container(text(label).size(13.0 * u).font(medium).color(ink))
+            .width(Length::Fixed(layout.button_w() as f32))
+            .height(Length::Fixed(BUTTONS as f32 * u))
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
             .style(move |_: &iced_widget::Theme| container::Style {
-                background: fill.map(Into::into),
-                border: Border { radius: r.into(), width: if primary { 0.0 } else { 1.0 }, color: look.inset_border },
+                background: Some(fill.into()),
+                border: Border { radius: radius.into(), width: 1.0, color: edge },
                 ..Default::default()
             })
             .into()
     };
-    let buttons = row![
-        Space::new().width(Length::Fill),
-        button("Cancel", false, hovered == Some(Button::Cancel), true),
-        button("Authenticate", true, hovered == Some(Button::Authenticate), model.can_submit()),
-    ]
-    .spacing(BUTTON_GAP as f32)
-    .height(Length::Fixed(layout.buttons as f32));
-
-    let body = column![
-        title,
-        Space::new().height(Length::Fixed(6.0)),
-        message,
-        Space::new().height(Length::Fixed(layout.gap as f32)),
-        who,
-        Space::new().height(Length::Fixed(layout.gap as f32)),
-        field,
-        Space::new().height(Length::Fixed(6.0)),
-        said,
-        Space::new().height(Length::Fixed(layout.gap as f32)),
-        buttons,
-    ]
-    .padding(layout.padding as f32);
-    kit::frame(body, &look)
+    card = card.push(
+        row![
+            button("Cancel", false, hovered == Some(Hot::Cancel), true),
+            button("Authenticate", true, hovered == Some(Hot::Authenticate), model.can_submit()),
+        ]
+        .spacing(BUTTON_GAP as f32 * u),
+    );
+    let inner_h = layout.card_h as f32 - (PAD_TOP + PAD_BOTTOM) as f32 * u;
+    let card = container(card).height(Length::Fixed(inner_h));
+    let panel = screen::glass_panel(
+        card,
+        theme,
+        layout.card_w as f32,
+        Padding { top: PAD_TOP as f32 * u, right: PAD_SIDE as f32 * u, bottom: PAD_BOTTOM as f32 * u, left: PAD_SIDE as f32 * u },
+    );
+    container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding { top: layout.card_y as f32, left: layout.card_x as f32, right: 0.0, bottom: 0.0 })
+        .into()
 }
 
 #[cfg(test)]
@@ -594,23 +621,36 @@ mod tests {
         assert!(m.key(Keysym::Return, None).is_none(), "not asked yet");
         asked(&mut m);
         assert!(matches!(m.key(Keysym::Return, None), Some(Action::Answer(_))));
-        m.shown(Shown::Checking);
         typed(&mut m, "x");
         assert_eq!(m.typed(), 0, "nothing is typed while checking");
         assert!(m.key(Keysym::Return, None).is_none());
     }
 
+    /// As on the lock: a failure stays on the card until the person
+    /// types, and the first character reopens the question.
     #[test]
-    fn a_failed_try_empties_the_field_and_says_so() {
+    fn a_failure_stays_until_typing_starts_again() {
         let mut m = model(&["alex"]);
         asked(&mut m);
         typed(&mut m, "wrong");
         m.key(Keysym::Return, None);
-        m.shown(Shown::Checking);
+        m.shown(Shown::Error("Authentication failure".into()));
         m.shown(Shown::TryAgain);
-        assert_eq!(m.typed(), 0);
-        assert!(matches!(m.said, Some(Said::Error(_))));
-        assert!(!m.can_submit(), "until the next question arrives");
+        asked(&mut m);
+        assert!(matches!(m.state(), State::Failed { reason } if reason == "Authentication failure"));
+        assert!(!m.can_submit());
+        typed(&mut m, "r");
+        assert!(matches!(m.state(), State::Asking { .. }));
+        assert_eq!(m.typed(), 1);
+    }
+
+    #[test]
+    fn a_failure_with_nothing_said_still_says_something() {
+        let mut m = model(&["alex"]);
+        asked(&mut m);
+        m.key(Keysym::Return, None);
+        m.shown(Shown::TryAgain);
+        assert!(matches!(m.state(), State::Failed { reason } if reason == TRY_AGAIN));
     }
 
     /// The model's Debug is how a panic or a log would show it, and it
@@ -632,57 +672,70 @@ mod tests {
         assert!(matches!(two.key(Keysym::Right, None), Some(Action::SwitchTo(u)) if u == "alex"), "wraps");
     }
 
-    /// The buttons a click finds are where the card draws them: inside
-    /// the card, side by side, Authenticate on the right.
+    /// What a click finds is where the card draws it: the buttons side
+    /// by side at the card's foot, inside it; the switch line between
+    /// the body and the buttons.
     #[test]
-    fn the_buttons_are_inside_the_card_and_do_not_overlap() {
-        let l = Layout::new(14.0, 2);
-        let (c, a) = (l.cancel(), l.authenticate());
-        assert!(c.x + c.w <= a.x);
-        assert!(a.x + a.w <= l.width - l.padding + 0.01);
-        assert!(a.y + a.h <= l.height - l.padding + 0.01);
-        assert!(a.y > l.user_top());
+    fn the_hit_areas_sit_inside_the_card_and_apart() {
+        for u in [0.8f32, 1.0, 1.6] {
+            let l = Layout::new(u, 2, true);
+            let (c, a, s) = (l.cancel(), l.authenticate(), l.switch().unwrap());
+            assert!(c.x + c.w <= a.x);
+            assert!(a.x + a.w <= l.card_x + l.card_w + 0.01);
+            assert!(a.y + a.h <= l.card_y + l.card_h + 0.01);
+            assert!(s.y + s.h <= c.y, "switch above the buttons");
+            assert!(s.y >= l.card_y + l.header + l.body, "and below the body");
+            assert!(l.card_y + l.card_h <= l.height && l.card_x + l.card_w <= l.width, "room for the shadow");
+        }
+        assert!(Layout::new(1.0, 2, false).switch().is_none());
     }
 
-    /// Draws the card to `$SHOTS/<name>.png` in a few states, to look at.
-    /// Ignored: it renders, it asserts nothing.
+    /// Draws the prompt to `$SHOTS/<name>.png` in a few states, to look
+    /// at. Ignored: it renders, it asserts nothing.
     #[test]
     #[ignore]
     fn render_the_card() {
-        use iced_runtime::core::{renderer::Style, Color, Rectangle, Size};
+        use iced_runtime::core::{renderer::Style, Rectangle, Size};
         use iced_runtime::user_interface::{Cache, UserInterface};
         let dir = std::path::PathBuf::from(std::env::var("SHOTS").expect("SHOTS"));
-        let mut theme = hyprforge_look::Theme::load(std::path::Path::new(&std::env::var("SHOTS_THEME").expect("SHOTS_THEME"))).unwrap();
-        theme.font_size = theme.drawable_font_size();
-        let look = Look::new(&theme);
+        let theme = hyprforge_look::Theme::load(std::path::Path::new(&std::env::var("SHOTS_THEME").expect("SHOTS_THEME"))).unwrap();
+        let theme = screen::renderable(theme);
         let scale = 1.6f32;
-        let states: Vec<(&str, Box<dyn Fn(&mut Model)>)> = vec![
-            ("asking", Box::new(|m: &mut Model| { asked(m); typed(m, "hunter2"); })),
-            ("fingerprint", Box::new(|m: &mut Model| m.shown(Shown::Info("Place your finger on the fingerprint reader".into())))),
-            ("failed", Box::new(|m: &mut Model| { asked(m); m.shown(Shown::Error("Authentication failure".into())); m.shown(Shown::TryAgain); asked(m); })),
+        type Set = Box<dyn Fn(&mut Model)>;
+        let states: Vec<(&str, &[&str], Set)> = vec![
+            ("asking", &["alex"], Box::new(|m: &mut Model| { asked(m); typed(m, "hunter2"); })),
+            ("fingerprint", &["alex"], Box::new(|m: &mut Model| m.shown(Shown::Info("Place your finger on the fingerprint reader".into())))),
+            ("failed", &["alex", "root"], Box::new(|m: &mut Model| { asked(m); m.key(Keysym::Return, None); m.shown(Shown::Error("Authentication failure".into())); m.shown(Shown::TryAgain); asked(m); })),
         ];
-        for (name, set) in states {
-            let mut m = model(&["alex", "root"]);
+        for (name, users, set) in states {
+            let mut m = model(users);
             m.request.message = "Authentication is required to mount SanDisk Ultra (/dev/sda1)".into();
             set(&mut m);
-            let layout = Layout::new(theme.font_size, 2);
+            let layout = Layout::new(screen::unit(&theme), 2, users.len() > 1);
             let (w, h) = (layout.width as f32, layout.height as f32);
             let (pw, ph) = ((w * scale).round() as u32, (h * scale).round() as u32);
-            let mut renderer = iced_tiny_skia::Renderer::new(iced_runtime::core::Font::DEFAULT, iced_runtime::core::Pixels(theme.font_size));
+            let mut renderer = iced_tiny_skia::Renderer::new(screen::font(&theme), iced_runtime::core::Pixels(theme.font_size));
             let size = Size::new(w, h);
-            let mut ui = UserInterface::<Infallible, iced_widget::Theme, iced_tiny_skia::Renderer>::build(view(&m, &layout, &look, None), size, Cache::default(), &mut renderer);
+            let mut ui = UserInterface::<Infallible, iced_widget::Theme, iced_tiny_skia::Renderer>::build(view(&m, &layout, &theme, None), size, Cache::default(), &mut renderer);
             ui.draw(&mut renderer, &iced_widget::Theme::Dark, &Style { text_color: Color::WHITE }, iced_runtime::core::mouse::Cursor::Unavailable);
-            let mut pixmap = tiny_skia::Pixmap::new(pw, ph).unwrap();
+            let mut card = tiny_skia::Pixmap::new(pw, ph).unwrap();
             let mut mask = tiny_skia::Mask::new(pw, ph).unwrap();
-            renderer.draw(&mut pixmap.as_mut(), &mut mask, &iced_tiny_skia::graphics::Viewport::with_physical_size(Size::new(pw, ph), scale), &[Rectangle::with_size(size)], Color::TRANSPARENT);
-            // Only now: the drawn text holds weak references to paragraphs
+            renderer.draw(&mut card.as_mut(), &mut mask, &iced_tiny_skia::graphics::Viewport::with_physical_size(Size::new(pw, ph), scale), &[Rectangle::with_size(size)], Color::TRANSPARENT);
+            // Only now: drawn text holds weak references to paragraphs
             // the UI tree owns, so dropping it first draws no text at all.
             drop(ui);
             // iced_tiny_skia writes BGRA, for Wayland; a PNG wants RGBA.
-            for px in pixmap.data_mut().chunks_exact_mut(4) {
+            for px in card.data_mut().chunks_exact_mut(4) {
                 px.swap(0, 2);
             }
-            pixmap.save_png(dir.join(format!("{name}.png"))).unwrap();
+            // Something to see the glass against — the lock's own
+            // generated wallpaper, when it is there — with the card over it.
+            let mut out = tiny_skia::Pixmap::new(pw, ph).unwrap();
+            if let Ok(wall) = tiny_skia::Pixmap::load_png(dir.join("wallpaper.png")) {
+                out.draw_pixmap(0, 0, wall.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
+            }
+            out.draw_pixmap(0, 0, card.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
+            out.save_png(dir.join(format!("{name}.png"))).unwrap();
         }
     }
 }

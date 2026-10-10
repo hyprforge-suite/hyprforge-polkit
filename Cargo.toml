@@ -41,6 +41,12 @@ hyprforge-look = "0.1"
 # What was typed lives in a Secret, whose Debug is a length and which
 # zeroes itself on drop.
 hyprforge-secret = "0.1"
+# The lock screen's card — its panel, avatar, field and the line under
+# the field — drawn by the lock's own code, so the two cannot drift; and
+# the conversation states that card is drawn from.
+hyprforge-authui = "0.1"
+# authui's scene is stamped with a time; the card never shows it.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["wayland"] }
 iced_runtime = "0.14"

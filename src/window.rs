@@ -10,7 +10,7 @@
 
 use crate::agent::{PromptHandle, Prompts};
 use crate::conversation::Did;
-use crate::prompt::{Layout, Model, PromptApp, Request, WIDTH};
+use crate::prompt::{Layout, Model, PromptApp, Request};
 use hyprforge_popup::geometry::Point;
 use hyprforge_popup::{Connection, Outcome, Placement, Popup};
 use iced_runtime::core::text::{self, LineHeight, Paragraph as _, Shaping, Text, Wrapping};
@@ -21,9 +21,12 @@ pub struct Wayland;
 
 impl Prompts for Wayland {
     fn open(&self, request: Request, did: UnboundedSender<Did>) -> std::io::Result<Box<dyn PromptHandle>> {
-        let mut theme = hyprforge_appearance::look::resolve();
-        theme.font_size = theme.drawable_font_size();
-        let layout = Layout::new(theme.font_size, message_lines(&request.message, theme.font_size));
+        // The lock's own guard on a theme it is about to draw — every
+        // value brought into a range the renderer accepts.
+        let theme = hyprforge_authui::screen::renderable(hyprforge_appearance::look::resolve());
+        let u = hyprforge_authui::screen::unit(&theme);
+        let lines = message_lines(&request.message, 13.0 * u, Layout::message_width(u), hyprforge_authui::screen::font(&theme));
+        let layout = Layout::new(u, lines, request.users.len() > 1);
         let placement = centred(layout).ok_or_else(|| std::io::Error::other("no monitor to show the prompt on"))?;
         let connection = Connection::connect_to_env().map_err(std::io::Error::other)?;
         let (tell, inbox) = hyprforge_popup::inbox();
@@ -47,14 +50,13 @@ impl Prompts for Wayland {
 /// How many lines polkit's message takes at the card's width — measured
 /// by the shaper that draws it, because only it knows where the
 /// sentence wraps.
-fn message_lines(message: &str, font_size: f32) -> usize {
-    let width = (WIDTH - 40.0) as f32;
+fn message_lines(message: &str, font_size: f32, width: f32, font: Font) -> usize {
     let paragraph = iced_tiny_skia::graphics::text::Paragraph::with_text(Text {
         content: message,
         bounds: Size::new(width, f32::INFINITY),
         size: Pixels(font_size),
         line_height: LineHeight::default(),
-        font: Font::DEFAULT,
+        font,
         align_x: text::Alignment::Left,
         align_y: alignment::Vertical::Top,
         shaping: Shaping::default(),
