@@ -703,9 +703,11 @@ mod tests {
         let scale = 1.6f32;
         type Set = Box<dyn Fn(&mut Model)>;
         let states: Vec<(&str, &[&str], Set)> = vec![
-            ("asking", &["alex"], Box::new(|m: &mut Model| { asked(m); typed(m, "hunter2"); })),
-            ("fingerprint", &["alex"], Box::new(|m: &mut Model| m.shown(Shown::Info("Place your finger on the fingerprint reader".into())))),
-            ("failed", &["alex", "root"], Box::new(|m: &mut Model| { asked(m); m.key(Keysym::Return, None); m.shown(Shown::Error("Authentication failure".into())); m.shown(Shown::TryAgain); asked(m); })),
+            // The suite's screenshot user, as in the README's lock and
+            // greeter shots — never a real account name.
+            ("asking", &["voldemort"], Box::new(|m: &mut Model| { asked(m); typed(m, "hunter2"); })),
+            ("fingerprint", &["voldemort"], Box::new(|m: &mut Model| m.shown(Shown::Info("Place your finger on the fingerprint reader".into())))),
+            ("failed", &["voldemort", "bellatrix"], Box::new(|m: &mut Model| { asked(m); m.key(Keysym::Return, None); m.shown(Shown::Error("Authentication failure".into())); m.shown(Shown::TryAgain); asked(m); })),
         ];
         for (name, users, set) in states {
             let mut m = model(users);
