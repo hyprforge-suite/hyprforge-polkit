@@ -55,5 +55,7 @@ iced_renderer = { version = "0.14", default-features = false, features = ["tiny-
 
 [dev-dependencies]
 tempfile = "3"
+# The live test reads polkitd's own description of its methods.
+zbus_xml = "5"
 # The ignored render test only: draws the card to a PNG to look at.
 tiny-skia = "0.11"

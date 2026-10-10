@@ -165,6 +165,19 @@ pub async fn session_id(system: &zbus::Connection) -> zbus::Result<String> {
     session.get_property::<String>("Id").await
 }
 
+/// `RegisterAuthenticationAgent`'s arguments: the subject (this login
+/// session), the locale, and the object path — as a plain string, which
+/// is polkitd's signature (`(sa{sv})ss`), not D-Bus's object-path type,
+/// which it refuses. `tests/live_polkit.rs` asks polkitd for its side.
+pub type Registration<'a> = ((&'static str, HashMap<&'static str, zbus::zvariant::Value<'a>>), String, &'static str);
+
+pub fn registration(session: &str) -> Registration<'_> {
+    let mut details: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
+    details.insert("session-id", session.into());
+    let locale = std::env::var("LANG").unwrap_or_else(|_| "C".into());
+    (("unix-session", details), locale, OBJECT_PATH)
+}
+
 /// Tells polkitd this agent answers for `session`.
 pub async fn register(system: &zbus::Connection, session: &str) -> zbus::Result<()> {
     let authority = zbus::Proxy::new(
@@ -174,12 +187,7 @@ pub async fn register(system: &zbus::Connection, session: &str) -> zbus::Result<
         "org.freedesktop.PolicyKit1.Authority",
     )
     .await?;
-    let mut details: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
-    details.insert("session-id", session.into());
-    let subject = ("unix-session", details);
-    let locale = std::env::var("LANG").unwrap_or_else(|_| "C".into());
-    let path = zbus::zvariant::ObjectPath::try_from(OBJECT_PATH)?;
-    authority.call::<_, _, ()>("RegisterAuthenticationAgent", &(subject, locale, path)).await
+    authority.call::<_, _, ()>("RegisterAuthenticationAgent", &registration(session)).await
 }
 
 #[cfg(test)]
@@ -270,6 +278,14 @@ mod tests {
         agent.cancel("cookie-9");
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.unwrap().unwrap();
         assert!(matches!(result, Err(PolkitError::Cancelled(_))), "{result:?}");
+    }
+
+    /// The shape polkitd takes — the path a string, not `o`. The first
+    /// live registration was refused for exactly that.
+    #[test]
+    fn registration_goes_out_in_polkitds_shape() {
+        use zbus::zvariant::Type;
+        assert_eq!(<Registration as Type>::SIGNATURE.to_string(), "((sa{sv})ss)");
     }
 
     #[test]
