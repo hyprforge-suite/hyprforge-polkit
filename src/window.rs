@@ -25,7 +25,7 @@ impl Prompts for Wayland {
         // value brought into a range the renderer accepts.
         let theme = hyprforge_authui::screen::renderable(hyprforge_appearance::look::resolve());
         let u = hyprforge_authui::screen::unit(&theme);
-        let lines = message_lines(&request.message, 13.0 * u, Layout::message_width(u), hyprforge_authui::screen::font(&theme));
+        let lines = message_lines(&crate::prompt::shown_message(&request.message), 13.0 * u, Layout::message_width(u), hyprforge_authui::screen::font(&theme));
         let layout = Layout::new(u, lines, request.users.len() > 1);
         let (placement, layout) = covering(layout).ok_or_else(|| std::io::Error::other("no monitor to show the prompt on"))?;
         let connection = Connection::connect_to_env().map_err(std::io::Error::other)?;
@@ -50,7 +50,7 @@ impl Prompts for Wayland {
 /// How many lines polkit's message takes at the card's width — measured
 /// by the shaper that draws it, because only it knows where the
 /// sentence wraps.
-fn message_lines(message: &str, font_size: f32, width: f32, font: Font) -> usize {
+pub(crate) fn message_lines(message: &str, font_size: f32, width: f32, font: Font) -> usize {
     let paragraph = iced_tiny_skia::graphics::text::Paragraph::with_text(Text {
         content: message,
         bounds: Size::new(width, f32::INFINITY),

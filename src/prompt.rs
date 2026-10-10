@@ -80,6 +80,25 @@ pub enum Action {
 
 const TRY_AGAIN: &str = "That didn't work. Try again.";
 
+/// polkit's message as the card shows it: every path kept on one line.
+///
+/// The line breaker may break after a `/`, so udisks2's "…to mount
+/// Horcruxes (/dev/sdb1)" wrapped as "(/" and "dev/sdb1)". A word joiner
+/// after each slash inside a word forbids that break and draws nothing.
+/// The prompt's height is measured from this same string, so the lines
+/// measured are the lines drawn.
+pub fn shown_message(message: &str) -> String {
+    let mut shown = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        shown.push(c);
+        if c == '/' && chars.peek().is_some_and(|next| !next.is_whitespace()) {
+            shown.push('\u{2060}');
+        }
+    }
+    shown
+}
+
 impl Model {
     pub fn new(request: Request) -> Model {
         Model { request, user: 0, state: State::Working, prompt: None, submitted: 0, caps_lock: false }
@@ -508,7 +527,7 @@ pub(crate) fn view<'a>(model: &'a Model, layout: &Layout, theme: &'a Theme, hove
 
     let header = column![
         text("Authentication required").size(TITLE as f32 * u).font(strong).color(fg),
-        text(model.request.message.as_str())
+        text(shown_message(&model.request.message))
             .size(MESSAGE as f32 * u)
             .font(font)
             .color(fade(theme.foreground, 0.7))
@@ -686,6 +705,15 @@ mod tests {
         assert!(matches!(m.state(), State::Failed { reason } if reason == TRY_AGAIN));
     }
 
+    /// A path in polkit's message never breaks across lines, and nothing
+    /// visible is added to the sentence.
+    #[test]
+    fn a_path_in_the_message_is_kept_whole() {
+        let shown = shown_message("to mount Horcruxes (/dev/sdb1) or a/ b");
+        assert_eq!(shown, "to mount Horcruxes (/\u{2060}dev/\u{2060}sdb1) or a/ b");
+        assert_eq!(shown.replace('\u{2060}', ""), "to mount Horcruxes (/dev/sdb1) or a/ b");
+    }
+
     /// The model's Debug is how a panic or a log would show it, and it
     /// must not hold the password.
     #[test]
@@ -742,6 +770,13 @@ mod tests {
 
     /// Draws the prompt to `$SHOTS/<name>.png` in a few states, to look
     /// at. Ignored: it renders, it asserts nothing.
+    ///
+    /// With `SHOTS_SCREEN=<w>x<h>` (logical pixels) it draws what a
+    /// monitor that size shows instead — the backdrop and the card
+    /// centred on it — over `$SHOTS/desktop.png`, which stands in for
+    /// whatever Hyprland's blur made of the desktop (blur it beforehand;
+    /// nothing here can). Without it, the card alone over
+    /// `$SHOTS/wallpaper.png`.
     #[test]
     #[ignore]
     fn render_the_card() {
@@ -761,9 +796,20 @@ mod tests {
         ];
         for (name, users, set) in states {
             let mut m = model(users);
-            m.request.message = "Authentication is required to mount SanDisk Ultra (/dev/sda1)".into();
+            // udisks2's own sentence, with a drive label to suit the persona.
+            m.request.message = "Authentication is required to mount Horcruxes (/dev/sdb1)".into();
             set(&mut m);
-            let layout = Layout::new(screen::unit(&theme), 2, users.len() > 1);
+            let u = screen::unit(&theme);
+            let lines = crate::window::message_lines(&shown_message(&m.request.message), 13.0 * u, Layout::message_width(u), screen::font(&theme));
+            let layout = Layout::new(u, lines, users.len() > 1);
+            let screen_size = std::env::var("SHOTS_SCREEN").ok().and_then(|s| {
+                let (w, h) = s.split_once('x')?;
+                Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?))
+            });
+            let layout = match screen_size {
+                Some((w, h)) => layout.on(w, h),
+                None => layout,
+            };
             let (w, h) = (layout.width as f32, layout.height as f32);
             let (pw, ph) = ((w * scale).round() as u32, (h * scale).round() as u32);
             let mut renderer = iced_tiny_skia::Renderer::new(screen::font(&theme), iced_runtime::core::Pixels(theme.font_size));
@@ -783,7 +829,8 @@ mod tests {
             // Something to see the glass against — the lock's own
             // generated wallpaper, when it is there — with the card over it.
             let mut out = tiny_skia::Pixmap::new(pw, ph).unwrap();
-            if let Ok(wall) = tiny_skia::Pixmap::load_png(dir.join("wallpaper.png")) {
+            let under = if screen_size.is_some() { "desktop.png" } else { "wallpaper.png" };
+            if let Ok(wall) = tiny_skia::Pixmap::load_png(dir.join(under)) {
                 out.draw_pixmap(0, 0, wall.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
             }
             out.draw_pixmap(0, 0, card.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
