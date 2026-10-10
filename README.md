@@ -10,6 +10,8 @@ native Hyprland desktop apps — but it runs alone. Installing this gets
 you an agent and nothing else; it needs no other Hyprforge component to
 start.
 
+![The administrator prompt: the lock screen's card over a blurred desktop, asking for a password to mount a drive](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/polkit.png)
+
 ## What it does
 
 polkitd decides *whether* a program may do something; when the answer
