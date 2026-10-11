@@ -152,15 +152,45 @@ impl Service {
 }
 
 /// This login session's id, for registering: `$XDG_SESSION_ID` when the
-/// session set it, otherwise logind's answer for this process.
+/// session set it, otherwise logind's answer for this process, otherwise
+/// the session logind says this user's display is in.
+///
+/// The last is the one a systemd user unit needs. The user manager and
+/// everything it starts belong to the user but to *no* session — its
+/// scope is `user@1000.service`, not `session-3.scope` — so asking for
+/// this process's session fails with `NoSessionForPID`, and the unit
+/// restarted every two seconds, 916 times, with no agent in between.
+/// `User.Display` is the graphical session the user is sitting at, which
+/// is also where polkitd itself looks when a subject has no session of
+/// its own; it's what `pkexec` from a terminal in that session asks
+/// about, so it's the one an agent has to answer for.
 pub async fn session_id(system: &zbus::Connection) -> zbus::Result<String> {
     if let Ok(id) = std::env::var("XDG_SESSION_ID") {
         if !id.is_empty() {
             return Ok(id);
         }
     }
+    logind_session(system).await
+}
+
+/// [`session_id`] without `$XDG_SESSION_ID`: what logind says.
+async fn logind_session(system: &zbus::Connection) -> zbus::Result<String> {
     let manager = zbus::Proxy::new(system, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager").await?;
-    let path: zbus::zvariant::OwnedObjectPath = manager.call("GetSessionByPID", &(std::process::id())).await?;
+    let path: zbus::zvariant::OwnedObjectPath = match manager.call("GetSessionByPID", &(std::process::id())).await {
+        Ok(path) => path,
+        Err(outside) => {
+            let user: zbus::zvariant::OwnedObjectPath = manager.call("GetUserByPID", &(std::process::id())).await?;
+            let user = zbus::Proxy::new(system, "org.freedesktop.login1", user, "org.freedesktop.login1.User").await?;
+            let (id, display) = user.get_property::<(String, zbus::zvariant::OwnedObjectPath)>("Display").await?;
+            // No display session reads as `("", "/")`: the user is only
+            // logged in over SSH, say. Then there is nothing to answer for,
+            // and the original error says why better than an empty id would.
+            if id.is_empty() {
+                return Err(outside);
+            }
+            display
+        }
+    };
     let session = zbus::Proxy::new(system, "org.freedesktop.login1", path, "org.freedesktop.login1.Session").await?;
     session.get_property::<String>("Id").await
 }
@@ -230,6 +260,32 @@ mod tests {
 
     fn just(names: &'static [&'static str]) -> impl Fn(&[Identity], &str) -> Vec<String> {
         move |_, _| names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Run from outside any session, which is where a systemd user unit
+    /// runs — and so does `cargo test` started from a terminal on
+    /// Hyprland, whose processes live in the user manager's `app.slice`.
+    /// `cargo test -p hyprforge-polkit -- --ignored outside`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_process_outside_any_session_answers_for_the_users_display() {
+        let Ok(system) = zbus::Connection::system().await else {
+            eprintln!("HYPRFORGE-SKIP: no system bus");
+            return;
+        };
+        let manager = zbus::Proxy::new(&system, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager").await.unwrap();
+        if manager.call::<_, _, zbus::zvariant::OwnedObjectPath>("GetSessionByPID", &(std::process::id())).await.is_ok() {
+            eprintln!("HYPRFORGE-SKIP: this test is inside a login session, so the fallback is not reached");
+            return;
+        }
+        let user: zbus::zvariant::OwnedObjectPath = manager.call("GetUserByPID", &(std::process::id())).await.unwrap();
+        let user = zbus::Proxy::new(&system, "org.freedesktop.login1", user, "org.freedesktop.login1.User").await.unwrap();
+        let (display, _) = user.get_property::<(String, zbus::zvariant::OwnedObjectPath)>("Display").await.unwrap();
+        if display.is_empty() {
+            eprintln!("HYPRFORGE-SKIP: this user has no display session to answer for");
+            return;
+        }
+        assert_eq!(logind_session(&system).await.unwrap(), display);
     }
 
     #[tokio::test]
