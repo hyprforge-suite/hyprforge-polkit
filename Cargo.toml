@@ -1,6 +1,6 @@
 [package]
 name = "hyprforge-polkit"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 license = "MIT"
 description = "A polkit authentication agent for Hyprland: the prompt for administrator access, drawn in the suite's look, relaying polkit's own PAM conversation — password, and fingerprint where the system's PAM stack offers it."
