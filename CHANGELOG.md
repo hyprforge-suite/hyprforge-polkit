@@ -2,6 +2,12 @@
 
 This component is released with the Hyprforge suite and shares its version: see the suite's `CHANGELOG.md`.
 
+## [0.1.13] - 2026-10-10
+
+<!-- Drafted by tools/changelog.py; sort into Added / Changed / Fixed before releasing. -->
+
+- First release as a component of the suite.
+
 ## [Unreleased]
 
 ### Added
