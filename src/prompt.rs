@@ -782,8 +782,15 @@ mod tests {
     fn render_the_card() {
         use iced_runtime::core::{renderer::Style, Rectangle, Size};
         use iced_runtime::user_interface::{Cache, UserInterface};
-        let dir = std::path::PathBuf::from(std::env::var("SHOTS").expect("SHOTS"));
-        let theme = hyprforge_look::Theme::load(std::path::Path::new(&std::env::var("SHOTS_THEME").expect("SHOTS_THEME"))).unwrap();
+        // check.sh runs every ignored test, and this one is a tool rather
+        // than a check: without somewhere to draw to it has nothing to
+        // do, which is a skip and not a failure.
+        let (Ok(dir), Ok(theme)) = (std::env::var("SHOTS"), std::env::var("SHOTS_THEME")) else {
+            eprintln!("HYPRFORGE-SKIP: render_the_card draws only with $SHOTS and $SHOTS_THEME set");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let theme = hyprforge_look::Theme::load(std::path::Path::new(&theme)).unwrap();
         let theme = screen::renderable(theme);
         let scale = 1.6f32;
         type Set = Box<dyn Fn(&mut Model)>;
