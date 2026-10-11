@@ -782,9 +782,9 @@ mod tests {
     fn render_the_card() {
         use iced_runtime::core::{renderer::Style, Rectangle, Size};
         use iced_runtime::user_interface::{Cache, UserInterface};
-        // check.sh runs every ignored test, and this one is a tool rather
-        // than a check: without somewhere to draw to it has nothing to
-        // do, which is a skip and not a failure.
+        // A tool rather than a check (the suite's `manual` tier, which
+        // nothing runs unasked): without somewhere to draw to it has
+        // nothing to do, which is a skip and not a failure.
         let (Ok(dir), Ok(theme)) = (std::env::var("SHOTS"), std::env::var("SHOTS_THEME")) else {
             eprintln!("HYPRFORGE-SKIP: render_the_card draws only with $SHOTS and $SHOTS_THEME set");
             return;
