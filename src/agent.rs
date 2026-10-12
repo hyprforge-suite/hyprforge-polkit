@@ -267,7 +267,7 @@ mod tests {
     /// Hyprland, whose processes live in the user manager's `app.slice`.
     /// `cargo test -p hyprforge-polkit -- --ignored outside`.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "live (systemd-logind): changes nothing"]
     async fn a_process_outside_any_session_answers_for_the_users_display() {
         let Ok(system) = zbus::Connection::system().await else {
             eprintln!("HYPRFORGE-SKIP: no system bus");

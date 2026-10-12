@@ -11,7 +11,7 @@
 //! said so.
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live (polkitd): changes nothing"]
 async fn polkitd_takes_registration_in_the_shape_the_agent_sends() {
     let system = match zbus::Connection::system().await {
         Ok(c) => c,

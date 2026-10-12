@@ -778,7 +778,7 @@ mod tests {
     /// nothing here can). Without it, the card alone over
     /// `$SHOTS/wallpaper.png`.
     #[test]
-    #[ignore]
+    #[ignore = "manual: a tool or a measurement, never run automatically"]
     fn render_the_card() {
         use iced_runtime::core::{renderer::Style, Rectangle, Size};
         use iced_runtime::user_interface::{Cache, UserInterface};
