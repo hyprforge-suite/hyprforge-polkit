@@ -76,13 +76,24 @@ impl Agent {
         identities: Vec<Identity>,
         users_of: impl Fn(&[Identity], &str) -> Vec<String>,
     ) -> Result<(), PolkitError> {
+        // Registered before waiting for the turn, not after. A request
+        // queued behind an open prompt is still polkitd's to cancel, and
+        // when the cookie was only recorded once the turn came, that
+        // cancel found nothing and was dropped — so the prompt opened
+        // later anyway, asking for a password on behalf of a process
+        // that had already given up.
+        let (did, mut answers) = mpsc::unbounded_channel();
+        let _registered = Registered::new(&self.cancels, &cookie, did.clone());
         let _turn = self.turn.lock().await;
+        // Nothing but a cancel can have arrived yet: no prompt is open to
+        // send anything else.
+        if let Ok(Did::Cancel) = answers.try_recv() {
+            return Err(PolkitError::Cancelled("the request was cancelled before it was shown".into()));
+        }
         let users = users_of(&identities, &self.me);
         let Some(first) = users.first().cloned() else {
             return Err(PolkitError::Failed("nobody this agent can ask is allowed to authenticate this".into()));
         };
-        let (did, mut answers) = mpsc::unbounded_channel();
-        self.cancels.lock().unwrap().insert(cookie.clone(), did.clone());
         let ended = match self.prompts.open(Request { message, action_id, users }, did) {
             Ok(prompt) => {
                 let ended = authenticate(&*self.connector, first, &cookie, |s| prompt.tell(Message::Shown(s)), &mut answers).await;
@@ -91,7 +102,6 @@ impl Agent {
             }
             Err(e) => Ended::Broken(format!("couldn't open the prompt: {e}")),
         };
-        self.cancels.lock().unwrap().remove(&cookie);
         match ended {
             Ended::Authenticated => Ok(()),
             Ended::Cancelled => Err(PolkitError::Cancelled("the request was dismissed".into())),
@@ -108,6 +118,53 @@ impl Agent {
             let _ = did.send(Did::Cancel);
         }
     }
+}
+
+/// A request's entry in [`Agent::cancels`], removed however the request
+/// ends — including its future being dropped mid-wait.
+struct Registered<'a> {
+    cancels: &'a Mutex<HashMap<String, UnboundedSender<Did>>>,
+    cookie: &'a str,
+}
+
+impl<'a> Registered<'a> {
+    fn new(cancels: &'a Mutex<HashMap<String, UnboundedSender<Did>>>, cookie: &'a str, did: UnboundedSender<Did>) -> Self {
+        cancels.lock().unwrap().insert(cookie.to_string(), did);
+        Registered { cancels, cookie }
+    }
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(self.cookie);
+    }
+}
+
+/// How long to wait for the bus to say who owns polkitd's name.
+const OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a call came from polkitd: its sender is the current owner of
+/// `org.freedesktop.PolicyKit1`. No sender, or no owner to compare it
+/// with, is not polkitd.
+fn from_polkitd(sender: Option<&str>, owner: Option<&str>) -> bool {
+    matches!((sender, owner), (Some(sender), Some(owner)) if sender == owner)
+}
+
+/// [`from_polkitd`], asking the bus for the owner — bounded, because the
+/// bus daemon is another process too.
+async fn caller_is_polkitd(connection: &zbus::Connection, header: &zbus::message::Header<'_>) -> bool {
+    let sender = header.sender().map(|name| name.as_str().to_string());
+    let owner = async {
+        let bus = zbus::fdo::DBusProxy::new(connection).await.ok()?;
+        let name = zbus::names::BusName::try_from("org.freedesktop.PolicyKit1").ok()?;
+        bus.get_name_owner(name).await.ok().map(|owner| owner.as_str().to_string())
+    };
+    let owner = tokio::time::timeout(OWNER_TIMEOUT, owner).await.ok().flatten();
+    let ok = from_polkitd(sender.as_deref(), owner.as_deref());
+    if !ok {
+        tracing::warn!(?sender, ?owner, "refused an authentication-agent call that did not come from polkitd");
+    }
+    ok
 }
 
 /// polkit's identities, `a(sa{sv})`, as [`Identity`]s. An identity of
@@ -129,10 +186,18 @@ pub fn identities(raw: &[(String, HashMap<String, OwnedValue>)]) -> Vec<Identity
 /// The D-Bus face of an [`Agent`].
 pub struct Service(pub Arc<Agent>);
 
+/// Both methods answer polkitd and nobody else. The object sits on the
+/// system bus, where any process may call it: without the check, anyone
+/// could open a password prompt worded as they liked — the helper would
+/// still only tell polkitd, but the user does not know that — or cancel a
+/// genuine one.
 #[zbus::interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl Service {
+    #[allow(clippy::too_many_arguments)]
     async fn begin_authentication(
         &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         action_id: String,
         message: String,
         _icon_name: String,
@@ -140,14 +205,24 @@ impl Service {
         cookie: String,
         identities: Vec<(String, HashMap<String, OwnedValue>)>,
     ) -> Result<(), PolkitError> {
+        if !caller_is_polkitd(connection, &header).await {
+            return Err(PolkitError::Failed("only polkitd may ask this agent to authenticate".into()));
+        }
         let ids = self::identities(&identities);
         self.0
             .begin(action_id, message, cookie, ids, |ids, me| identity::choices(ids, me, identity::user_name, identity::group_members))
             .await
     }
 
-    async fn cancel_authentication(&self, cookie: String) {
-        self.0.cancel(&cookie);
+    async fn cancel_authentication(
+        &self,
+        #[zbus(connection)] connection: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        cookie: String,
+    ) {
+        if caller_is_polkitd(connection, &header).await {
+            self.0.cancel(&cookie);
+        }
     }
 }
 
@@ -334,6 +409,68 @@ mod tests {
         agent.cancel("cookie-9");
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.unwrap().unwrap();
         assert!(matches!(result, Err(PolkitError::Cancelled(_))), "{result:?}");
+    }
+
+    /// A request waiting its turn behind another can be cancelled, and
+    /// its prompt then never opens. The cancel used to be dropped — the
+    /// cookie was only recorded once the turn came — so polkitd's "the
+    /// asker gave up" was lost and a password prompt opened later for
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_request_cancelled_while_it_waits_its_turn_never_opens_a_prompt() {
+        struct Silent(Arc<Mutex<Vec<Request>>>);
+        struct Nothing;
+        impl PromptHandle for Nothing {
+            fn tell(&self, _: Message) {}
+        }
+        impl Prompts for Silent {
+            fn open(&self, request: Request, _: UnboundedSender<Did>) -> std::io::Result<Box<dyn PromptHandle>> {
+                self.0.lock().unwrap().push(request);
+                Ok(Box::new(Nothing))
+            }
+        }
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let agent = Arc::new(Agent::new(Arc::new(Scripted::new("right")), Arc::new(Silent(opened.clone())), "alex".into()));
+        let begin = |cookie: &'static str, message: &'static str| {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.begin("a".into(), message.into(), cookie.into(), vec![], just(&["alex"])).await })
+        };
+        let first = begin("first", "one");
+        while opened.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let second = begin("second", "two");
+        // Until the second is queued on the turn rather than not yet
+        // started — bounded, because the bug is that it never registers.
+        let giving_up_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !agent.cancels.lock().unwrap().contains_key("second") && tokio::time::Instant::now() < giving_up_at {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        agent.cancel("second");
+        agent.cancel("first");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), first).await.unwrap().unwrap();
+        assert!(matches!(first, Err(PolkitError::Cancelled(_))), "{first:?}");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("the cancelled request opened a prompt and waited on it")
+            .unwrap();
+        assert!(matches!(second, Err(PolkitError::Cancelled(_))), "{second:?}");
+        assert_eq!(opened.lock().unwrap().len(), 1, "a prompt opened for a cancelled request");
+        assert!(agent.cancels.lock().unwrap().is_empty(), "a finished request is still registered");
+    }
+
+    /// Only polkitd may start or cancel an authentication. Anyone else on
+    /// the system bus calling this object would otherwise put a password
+    /// prompt of their own wording in front of the user — or cancel a
+    /// genuine one.
+    #[test]
+    fn only_the_owner_of_polkits_name_is_answered() {
+        assert!(from_polkitd(Some(":1.5"), Some(":1.5")));
+        assert!(!from_polkitd(Some(":1.77"), Some(":1.5")), "a stranger on the bus");
+        assert!(!from_polkitd(None, Some(":1.5")), "no sender at all");
+        assert!(!from_polkitd(Some(":1.5"), None), "polkitd not running, or not answering in time");
+        assert!(!from_polkitd(None, None));
     }
 
     /// The shape polkitd takes — the path a string, not `o`. The first
