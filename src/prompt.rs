@@ -183,11 +183,7 @@ impl Model {
 
     fn type_text(&mut self, typed: &str) {
         match &mut self.state {
-            State::Asking { entered, .. } => {
-                let mut longer = entered.expose().clone();
-                longer.push_str(typed);
-                *entered = Secret::new(longer);
-            }
+            State::Asking { entered, .. } => *entered = Secret::new(appended(entered.expose(), typed)),
             // Typing again is what takes a failure off the screen.
             State::Failed { .. } => {
                 if let Some(prompt) = self.prompt.clone() {
@@ -511,6 +507,19 @@ const BACKDROP: f32 = 0.45;
 
 type El<'a> = Element<'a, Infallible, iced_widget::Theme, iced_tiny_skia::Renderer>;
 
+/// What has been typed with `typed` on the end, in one allocation.
+///
+/// Cloning and then `push_str`-ing grew the clone, and growing it moves
+/// it: the buffer it outgrew was freed with the password in it, where
+/// the `Secret` that erases on drop never sees it. Sized up front, the
+/// bytes are written once, into the buffer the `Secret` then owns.
+fn appended(entered: &str, typed: &str) -> String {
+    let mut longer = String::with_capacity(entered.len() + typed.len());
+    longer.push_str(entered);
+    longer.push_str(typed);
+    longer
+}
+
 fn fade(c: hyprforge_look::Color, alpha: f32) -> Color {
     let c = to_iced(c);
     Color { a: c.a * alpha, ..c }
@@ -631,6 +640,16 @@ mod tests {
         for c in s.chars() {
             m.key(Keysym::NoSymbol, Some(&c.to_string()));
         }
+    }
+
+    /// Appending a keystroke must not leave a copy of what was typed in
+    /// a freed buffer. Growing a clone does — and leaves it visible in
+    /// the capacity, which doubles when a `String` grows.
+    #[test]
+    fn a_keystroke_is_appended_without_regrowing_the_buffer() {
+        let longer = appended("dummy", "x");
+        assert_eq!(longer.len(), 6);
+        assert_eq!(longer.capacity(), 6, "the buffer grew, so an older copy was freed unerased");
     }
 
     fn answer_of(action: Option<Action>) -> String {
